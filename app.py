@@ -1,118 +1,150 @@
-"""
-10-Day VaR and ES Pricer using Monte Carlo Simulation
-Jeffrey Yang
-Date: 08/15/2024
+import numpy as np, pandas as pd, matplotlib.pyplot as plt, streamlit as st, yfinance as yf, torch, torch.nn as nn
+from datetime import date, timedelta
+from montecarlo import ARGARCHModel, ARGARCHConfig
 
-Dependencies:
-pip install flask numpy pandas matplotlib alpaca-trade-api
-"""
+st.set_page_config(page_title="AR-GARCH vs LSTM", layout="wide")
 
-from flask import Flask, request, jsonify, render_template
-import alpaca_trade_api as tradeapi
-import numpy as np
-import pandas as pd
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-import io
-import base64
-from datetime import datetime, timedelta
+def to_series(x, name=None):
+    if isinstance(x, pd.Series): return x if name is None else x.rename(name)
+    if isinstance(x, pd.DataFrame): return (x.squeeze("columns") if name is None else x.squeeze("columns").rename(name))
+    return pd.Series(np.asarray(x).ravel(), name=name)
 
-app = Flask(__name__)
+@st.cache_data(show_spinner=False)
+def load_prices_and_returns(ticker, start, end):
+    df = yf.download(ticker, start=start, end=end, interval="1d", progress=False)
+    col = "Adj Close" if "Adj Close" in df.columns else "Close"
+    prices = to_series(df[col].dropna(), "Price")
+    rets = to_series(np.log(prices / prices.shift(1)).dropna(), "Log returns")
+    return prices, rets
 
-# Alpaca credentials (free-tier friendly)
-BASE_URL = "https://paper-api.alpaca.markets/v2"
-ALPACA_API_KEY = "PKVA53DC6M2II8VQBKC8"
-ALPACA_SECRET_KEY = "kknfcEo2aOiMKQBd0WmlC78FkAkeu68xofhS45LY"
+class LSTM1(nn.Module):
+    def __init__(self, hidden=32):
+        super().__init__()
+        self.lstm = nn.LSTM(1, hidden, batch_first=True)
+        self.fc = nn.Linear(hidden, 1)
+    def forward(self, x):
+        y,_ = self.lstm(x)
+        return self.fc(y[:, -1, :])
 
-api = tradeapi.REST(ALPACA_API_KEY, ALPACA_SECRET_KEY, BASE_URL, api_version='v2')
+def mk_seq(a, L):
+    X,Y = [],[]
+    for i in range(len(a)-L):
+        X.append(a[i:i+L]); Y.append(a[i+L])
+    X = np.array(X)[:, :, None]; Y = np.array(Y)[:, None]
+    return torch.tensor(X, dtype=torch.float32), torch.tensor(Y, dtype=torch.float32)
 
+def train_lstm(rets, seq_len=30, epochs=60, lr=1e-3, hidden=32, device=None):
+    r = rets.dropna().values.astype(np.float32)
+    m, s = r.mean(), r.std() if r.std()>0 else 1.0
+    z = (r - m) / s
+    X,y = mk_seq(z, seq_len)
+    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    X,y = X.to(device), y.to(device)
+    model = LSTM1(hidden).to(device)
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    lossf = nn.MSELoss()
+    model.train()
+    for _ in range(epochs):
+        opt.zero_grad(); loss = lossf(model(X), y); loss.backward(); opt.step()
+    model.eval()
+    with torch.no_grad():
+        fit = model(X).cpu().numpy().ravel()*s + m
+    idx = rets.index[seq_len:]
+    fit_series = pd.Series(fit, index=idx, name="LSTM fitted")
+    return model, m, s, fit_series, seq_len, device
 
-def get_stock_data(ticker):
-    # Historical window: 2 years
-    end_date = datetime.now().date().isoformat()
-    start_date = (datetime.now() - timedelta(days=2 * 365)).date().isoformat()
+def forecast_lstm(model, rets, mean, std, seq_len, horizon, device=None):
+    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    r = rets.dropna().values.astype(np.float32)
+    z = (r - mean) / std
+    w = z[-seq_len:].tolist()
+    out = []
+    model.eval()
+    for _ in range(int(horizon)):
+        x = torch.tensor(np.array(w)[None, :, None], dtype=torch.float32, device=device)
+        with torch.no_grad():
+            p = model(x).item()
+        out.append(p); w = w[1:] + [p]
+    out = np.array(out)*std + mean
+    return out
 
-    bars = api.get_bars(ticker, tradeapi.TimeFrame.Day, start=start_date, end=end_date, feed='iex').df
+with st.sidebar:
+    st.header("Settings")
+    ticker = st.text_input("Ticker", value="SPY")
+    start = st.date_input("Start", value=date.today() - timedelta(days=365))
+    end = st.date_input("End", value=date.today())
+    horizon = st.number_input("Forecast horizon (days)", 5, 252, 20)
+    n_paths = st.number_input("Monte Carlo paths", 500, 100_000, 5000, step=500)
+    run = st.button("Run")
 
-    if bars.empty or len(bars) < 20:
-        raise ValueError(f"No sufficient historical data for {ticker}")
+st.title("AR(1)-GARCH(1,1)-t vs LSTM")
 
-    # Use latest available close as S0
-    S0 = bars['close'][-1]
+if run:
+    prices, rets = load_prices_and_returns(ticker, str(start), str(end))
+    c1,c2 = st.columns(2, gap="large")
+    with c1: st.line_chart(prices)
+    with c2: st.line_chart(rets)
 
-    # Compute log returns and daily volatility
-    bars['returns'] = np.log(bars['close'] / bars['close'].shift(1))
-    sigma_daily = np.std(bars['returns'].dropna())
+    cfg = ARGARCHConfig(ar_lags=1, garch_p=1, garch_q=1, dist="student_t")
+    model = ARGARCHModel(cfg).fit(rets.values)
+    res = model._res
 
-    return S0, sigma_daily
+    phi = float(res.params.get("ar.L1", 0.0))
+    c   = float(res.params.get("Const", 0.0))
+    m   = float(rets.mean())
+    s   = float(rets.std())
+    mu_hist = ((1 - phi) * m + s * c + phi * rets.shift(1)).dropna().rename("AR fitted")
 
+    model_lstm, mL, sL, lstm_fit, L, dev = train_lstm(rets, seq_len=30, epochs=60, lr=1e-3, hidden=32)
 
-def simulate_10_day_paths(S0, r, sigma, M=10, I=10000):
-    dt = 1 / 252
-    paths = np.zeros((M + 1, I))
-    paths[0] = S0
-    for t in range(1, M + 1):
-        z = np.random.standard_normal(I)
-        paths[t] = paths[t - 1] * np.exp((r - 0.5 * sigma ** 2) * dt + sigma * np.sqrt(dt) * z)
-    return paths
+    colA, colB = st.columns(2, gap="large")
+    with colA:
+        fig, ax = plt.subplots()
+        ax.plot(rets.index, rets.values, lw=1, label="Returns")
+        ax.plot(mu_hist.index, mu_hist.values, lw=1, label="AR fitted")
+        ax.set_title("Fit: AR-GARCH")
+        ax.legend()
+        st.pyplot(fig)
+    with colB:
+        fig, ax = plt.subplots()
+        ax.plot(rets.index, rets.values, lw=1, label="Returns")
+        ax.plot(lstm_fit.index, lstm_fit.values, lw=1, label="LSTM fitted")
+        ax.set_title("Fit: LSTM")
+        ax.legend()
+        st.pyplot(fig)
 
+    H = int(horizon)
+    N = int(n_paths)
+    paths = model.simulate_paths(horizon=H, n_paths=N, random_state=42)
+    fan_q = np.percentile(paths, [5, 25, 50, 75, 95], axis=1)
+    x = np.arange(1, H + 1)
+    lstm_fc = forecast_lstm(model_lstm, rets, mL, sL, L, H)
 
-def compute_var_es(paths, alpha=0.05):
-    S_T = paths[-1]
-    losses = paths[0] - S_T  # 10-day losses
-    var = np.percentile(losses, alpha * 100)
-    es = losses[losses >= var].mean()  # Expected Shortfall (Conditional VaR)
-    return var, es
+    colC, colD = st.columns(2, gap="large")
+    with colC:
+        fig, ax = plt.subplots()
+        ax.plot(x, fan_q[2], lw=1.2, label="MC median")
+        ax.fill_between(x, fan_q[1], fan_q[3], alpha=0.30, label="MC IQR")
+        ax.fill_between(x, fan_q[0], fan_q[4], alpha=0.15, label="MC 90%")
+        ax.plot(x, lstm_fc, lw=1.2, label="LSTM")
+        ax.set_xlabel("Steps ahead"); ax.set_ylabel("Return")
+        ax.set_title("Forecast: MC vs LSTM (returns)")
+        ax.legend()
+        st.pyplot(fig)
 
-
-@app.route('/')
-def index():
-    return render_template('index.html')
-
-
-@app.route('/price', methods=['POST'])
-def price():
-    try:
-        ticker = request.form['ticker'].upper()
-        r = float(request.form['r'])
-        I = int(request.form['I'])
-
-        # Get current price and daily volatility
-        S0, sigma = get_stock_data(ticker)
-
-        M = 10  # 10-day VaR horizon
-        paths = simulate_10_day_paths(S0, r, sigma, M, I)
-        var, es = compute_var_es(paths, alpha=0.05)
-
-        # Plot simulation paths
-        fig, ax = plt.subplots(figsize=(10, 6))
-        ax.plot(paths[:, :100])  # only show first 100 paths for clarity
-        ax.set_title(f'Simulated 10-Day Price Paths for {ticker}')
-        ax.set_xlabel('Days')
-        ax.set_ylabel('Price')
-        ax.grid(True)
-
-        # Convert plot to base64
-        buf = io.BytesIO()
-        plt.savefig(buf, format='png', bbox_inches='tight')
-        buf.seek(0)
-        image_base64 = base64.b64encode(buf.read()).decode('utf-8')
-        buf.close()
-        plt.close(fig)
-
-        return jsonify({
-            'ticker': ticker,
-            'S0': round(S0, 2),
-            'sigma_daily': round(sigma, 5),
-            'VaR_95': round(var, 2),
-            'ES_95': round(es, 2),
-            'image_base64': image_base64
-        })
-
-    except Exception as e:
-        return jsonify({'error': str(e)})
-
-
-if __name__ == '__main__':
-    app.run(debug=True)
+    with colD:
+        last_price = float(prices.iloc[-1])
+        price_paths = last_price * np.exp(np.cumsum(paths, axis=0))
+        pfan = np.percentile(price_paths, [5, 25, 50, 75, 95], axis=1)
+        lstm_price = last_price * np.exp(np.cumsum(lstm_fc))
+        fig, ax = plt.subplots()
+        ax.plot(x, pfan[2], lw=1.2, label="MC median")
+        ax.fill_between(x, pfan[1], pfan[3], alpha=0.30, label="MC IQR")
+        ax.fill_between(x, pfan[0], pfan[4], alpha=0.15, label="MC 90%")
+        ax.plot(x, lstm_price, lw=1.2, label="LSTM")
+        ax.set_xlabel("Steps ahead"); ax.set_ylabel("Price")
+        ax.set_title("Forecast: MC vs LSTM (price)")
+        ax.legend()
+        st.pyplot(fig)
+else:
+    st.info("Choose settings and click Run.")
