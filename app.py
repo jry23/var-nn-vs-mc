@@ -8,6 +8,7 @@ from data import *
 
 st.set_page_config(layout="wide")
 st.title("Comparing Time-Series Methods for Market Risk Forecasts")
+st.markdown("##### *Author: Jeffrey Yang, jry33@cornell.edu*")
 
 st.sidebar.header("Configuration:")
 ticker = st.sidebar.text_input("Ticker", "SPY")
